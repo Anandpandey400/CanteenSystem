@@ -1,0 +1,652 @@
+CREATE PROCEDURE dbo.Stp_Order
+(
+    @flag          NVARCHAR(50),
+    @orderRefId    NVARCHAR(50) = null,
+    @empId          INT =NULL,
+    @status  INT = NULL,
+    @orderAmnt float = null,
+    @statusId int = null,
+    @orderId int = null,
+    @cart NVARCHAR(MAX) = null,
+    @walletDeduction INT  = null,
+    @capDeduction    INT  = null,
+    @walletId int = null,
+     @refundAmnt     DECIMAL(18,2)= null,
+    @currtbal       DECIMAL(18,2)= null,
+    @newBalance     DECIMAL(18,2)= null,
+    @paymentype     NVARCHAR(50)= null,
+    @currentCAP     FLOAT= null
+)
+
+AS
+BEGIN
+    set @status = 7;
+    SET NOCOUNT ON;
+    IF (@flag = 'getAllOrders')
+    BEGIN
+       SELECT
+    o1.id,
+    o1.OrderId,
+    em.employee_name,
+    em.employee_code,
+    o1.amount,
+    gm.name AS status,
+
+    STRING_AGG(
+        mm.menuName + ' (' + CAST(ordi.Quantity AS VARCHAR) + ')',
+        ', '
+    ) AS OrderItems,
+
+    o1.createdAt,
+
+    (
+        SELECT SUM(oi.Quantity)
+        FROM OrderItems oi
+        WHERE oi.OrderId = o1.id
+    ) AS itemQuantity,
+
+    (
+        SELECT
+            mm2.menuName,
+            mm2.price,
+            oi2.Quantity
+        FROM OrderItems oi2
+        JOIN menuMaster mm2 ON mm2.id = oi2.MenuId
+        WHERE oi2.OrderId = o1.id
+        FOR JSON PATH
+    ) AS items,
+
+ordi.remark
+
+FROM Orders o1
+
+LEFT JOIN EmployeeMaster em ON em.id = o1.EmployeeId
+LEFT JOIN genericMaster gm ON gm.id = o1.status
+
+-- ✅ ADD THESE JOINS
+LEFT JOIN OrderItems ordi ON ordi.OrderId = o1.id
+LEFT JOIN menuMaster mm ON mm.id = ordi.MenuId
+
+-- ✅ REQUIRED for STRING_AGG
+GROUP BY
+    o1.id,
+    o1.OrderId,
+    em.employee_name,
+    em.employee_code,
+    o1.amount,
+    gm.name,
+    o1.createdAt,
+    ordi.remark
+
+ORDER BY o1.id DESC;
+
+    END
+
+    IF (@flag = 'PlaceOrder')
+BEGIN
+    SET NOCOUNT ON;
+
+    BEGIN TRANSACTION;
+    BEGIN TRY
+
+        /*------------------------------------------------------------
+          0. Default Status
+        ------------------------------------------------------------*/
+        IF @status IS NULL
+            SET @status = 7;
+
+        /*------------------------------------------------------------
+          1. Build Trade Inventory ONLY
+        ------------------------------------------------------------*/
+        DECLARE @TradeInventory TABLE
+        (
+            itemId INT,
+            requiredQty DECIMAL(18,4)
+        );
+
+        -- ONLY Trade items (menuName → itemName)
+        INSERT INTO @TradeInventory (itemId, requiredQty)
+        SELECT
+            im.id,
+            SUM(c.quantity)
+        FROM OPENJSON(@cart)
+        WITH (
+            menuItemId INT '$.menuItemId',
+            quantity   INT '$.quantity'
+        ) c
+        JOIN menuMaster mm ON mm.id = c.menuItemId
+        JOIN itemMaster im ON im.itemName = mm.menuName
+        GROUP BY im.id;
+
+        /*------------------------------------------------------------
+          2. Inventory Validation (ONLY Trade Items)
+        ------------------------------------------------------------*/
+        IF EXISTS (
+            SELECT 1
+            FROM @TradeInventory r
+            JOIN (
+                SELECT itemId, SUM(amount) AS totalQty
+                FROM inventoryMaster
+                GROUP BY itemId
+            ) i ON i.itemId = r.itemId
+            WHERE i.totalQty < r.requiredQty
+        )
+        BEGIN
+            ROLLBACK TRANSACTION;
+            SELECT 'Insufficient inventory' AS result;
+            RETURN;
+        END
+
+        /*------------------------------------------------------------
+          3. Insert Order
+        ------------------------------------------------------------*/
+        INSERT INTO Orders (orderid, employeeid, status, amount)
+        VALUES (@orderRefId, @empId, @status, @orderAmnt);
+
+        DECLARE @newOrderId INT = SCOPE_IDENTITY();
+
+        /*------------------------------------------------------------
+          4. Insert Order Items
+        ------------------------------------------------------------*/
+        INSERT INTO OrderItems (OrderId, MenuId, Quantity,remark)
+        SELECT
+            @newOrderId,
+            menuItemId,
+            quantity,
+            remark
+        FROM OPENJSON(@cart)
+        WITH (
+            menuItemId INT '$.menuItemId',
+            quantity   INT '$.quantity',
+            remark nvarchar(max) '$.remark'
+        );
+
+        /*------------------------------------------------------------
+          5. FIFO Inventory Deduction (ONLY Trade Items)
+        ------------------------------------------------------------*/
+        IF EXISTS (SELECT 1 FROM @TradeInventory)
+        BEGIN
+            DECLARE
+                @itemId INT,
+                @reqQty DECIMAL(18,4),
+                @invId INT,
+                @invQty DECIMAL(18,4),
+                @deductQty DECIMAL(18,4);
+
+            DECLARE req_cursor CURSOR FOR
+            SELECT itemId, requiredQty FROM @TradeInventory;
+
+            OPEN req_cursor;
+            FETCH NEXT FROM req_cursor INTO @itemId, @reqQty;
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                WHILE @reqQty > 0
+                BEGIN
+                    SELECT TOP 1
+                        @invId = id,
+                        @invQty = amount
+                    FROM inventoryMaster
+                    WHERE itemId = @itemId AND amount > 0
+                    ORDER BY createdAt; -- FIFO
+
+                    SET @deductQty =
+                        CASE WHEN @invQty >= @reqQty THEN @reqQty ELSE @invQty END;
+
+                    UPDATE inventoryMaster
+                    SET amount = amount - @deductQty,
+                        updatedAt = GETDATE()
+                    WHERE id = @invId;
+
+                    INSERT INTO InventoryLogs
+                    (
+                        inventoryId, itemId, actionType,
+                        previousAmount, changeAmount, newAmount, reason
+                    )
+                    VALUES
+                    (
+                        @invId, @itemId, 'DEBIT',
+                        @invQty, @deductQty, @invQty - @deductQty,
+                        CONCAT('Order placed: ', @orderRefId)
+                    );
+
+                    SET @reqQty = @reqQty - @deductQty;
+                END
+
+                FETCH NEXT FROM req_cursor INTO @itemId, @reqQty;
+            END
+
+            CLOSE req_cursor;
+            DEALLOCATE req_cursor;
+        END
+
+        /*------------------------------------------------------------
+          6. Wallet / CAP Deduction
+        ------------------------------------------------------------*/
+        DECLARE
+            @prevAmt INT,
+            @newAmt INT,
+            @capAmnt INT;
+
+        IF @capDeduction > 0
+        BEGIN
+            SELECT @capAmnt = remainingCap
+            FROM EmployeeMaster
+            WHERE id = @empId;
+
+            IF @capAmnt < @capDeduction
+            BEGIN
+                ROLLBACK TRANSACTION;
+                SELECT 'Insufficient CAP balance' AS result;
+                RETURN;
+            END
+
+            UPDATE EmployeeMaster
+            SET remainingCap = @capAmnt - @capDeduction
+            WHERE id = @empId;
+
+            INSERT INTO walletLogs
+            (walletId, actionType, prevAmnt, changeAmnt, newAmnt, description, paymentMode)
+            VALUES
+            (@walletId, 'Debit', @capAmnt, @capDeduction,
+             @capAmnt - @capDeduction, @orderRefId, 'CAP');
+
+            IF @walletDeduction > 0
+            BEGIN
+                SELECT @prevAmt = balance
+                FROM walletMaster
+                WHERE id = @walletId;
+
+                IF @prevAmt < @walletDeduction
+                BEGIN
+                    ROLLBACK TRANSACTION;
+                    SELECT 'Insufficient wallet balance' AS result;
+                    RETURN;
+                END
+
+                SET @newAmt = @prevAmt - @walletDeduction;
+
+                UPDATE walletMaster
+                SET balance = @newAmt,
+                    updatedAt = GETDATE()
+                WHERE id = @walletId;
+
+                INSERT INTO walletLogs
+                (walletId, actionType, prevAmnt, changeAmnt, newAmnt, description, paymentMode)
+                VALUES
+                (@walletId, 'Debit', @prevAmt, @walletDeduction,
+                 @newAmt, @orderRefId, 'WALLET');
+            END
+        END
+        ELSE
+        BEGIN
+            SELECT @prevAmt = balance
+            FROM walletMaster
+            WHERE id = @walletId;
+
+            IF @prevAmt < @orderAmnt
+            BEGIN
+                ROLLBACK TRANSACTION;
+                SELECT 'Insufficient wallet balance' AS result;
+                RETURN;
+            END
+
+            SET @newAmt = @prevAmt - @orderAmnt;
+
+            UPDATE walletMaster
+            SET balance = @newAmt,
+                updatedAt = GETDATE()
+            WHERE id = @walletId;
+
+            INSERT INTO walletLogs
+            (walletId, actionType, prevAmnt, changeAmnt, newAmnt, description, paymentMode)
+            VALUES
+            (@walletId, 'Debit', @prevAmt, @orderAmnt,
+             @newAmt, @orderRefId, 'WALLET');
+        END
+
+        /*------------------------------------------------------------
+          7. SUCCESS
+        ------------------------------------------------------------*/
+        COMMIT TRANSACTION;
+
+        SELECT
+            'SUCCESS'   AS result,
+            @newOrderId AS orderId,
+            @orderRefId AS orderRefId,
+            @orderAmnt  AS amount;
+
+    END TRY
+    BEGIN CATCH
+        ROLLBACK TRANSACTION;
+        SELECT ERROR_MESSAGE() AS result;
+    END CATCH
+END
+
+    IF (@flag = 'UpdateStatus')
+BEGIN
+    IF (@statusId = 10)  -- Refund
+    BEGIN
+        BEGIN TRANSACTION;
+
+        BEGIN TRY
+            -- Get order & employee
+            SELECT
+                @empId = EmployeeId,
+                @refundAmnt = amount,
+                @orderRefId = OrderId
+            FROM Orders
+            WHERE id = @orderId;
+
+         DECLARE @UpdatedInventory TABLE
+(
+    inventoryId INT,
+    itemId INT,
+    previousAmount DECIMAL(18,4),
+    newAmount DECIMAL(18,4),
+    changeAmount DECIMAL(18,4)
+);
+
+-- Step 1: Aggregate refund quantity
+WITH RefundData AS (
+    SELECT
+        im.id AS itemId,
+        SUM(ort.Quantity) AS qty
+    FROM OrderItems ort
+    JOIN menuMaster mm ON mm.id = ort.MenuId
+    JOIN itemMaster im ON im.itemName = mm.menuName
+    WHERE ort.OrderId = @orderId
+    GROUP BY im.id
+),
+
+-- Step 2: Latest inventory row
+LatestInventory AS (
+    SELECT *
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY itemId ORDER BY id DESC) AS rn
+        FROM inventoryMaster
+    ) t
+    WHERE rn = 1
+)
+
+-- Step 3: Update + capture
+UPDATE li
+SET
+    li.amount = li.amount + rd.qty,
+    li.updatedAt = GETDATE()
+OUTPUT
+    inserted.id,
+    inserted.itemId,
+    deleted.amount,
+    inserted.amount,
+    rd.qty
+INTO @UpdatedInventory
+FROM LatestInventory li
+JOIN RefundData rd
+    ON rd.itemId = li.itemId;
+
+-- Step 4: Insert logs separately (SAFE)
+INSERT INTO InventoryLogs
+(
+    inventoryId,
+    itemId,
+    actionType,
+    previousAmount,
+    changeAmount,
+    newAmount,
+    reason
+)
+SELECT
+    ui.inventoryId,
+    ui.itemId,
+    'CREDIT',
+    ui.previousAmount,
+    ui.changeAmount,
+    ui.newAmount,
+    CONCAT('Refund: ', @orderRefId)
+FROM @UpdatedInventory ui;
+
+            -- Get wallet
+            SELECT
+                @walletId = id,
+                @currtbal = balance
+            FROM walletMaster
+            WHERE employeeId = @empId;
+
+            -- Get last payment type
+            SELECT TOP 1
+                @paymentype = paymentMode
+            FROM walletLogs
+            WHERE description = @orderRefId
+            ORDER BY id DESC;
+
+            /* ---------------- CAP REFUND ---------------- */
+            IF (@paymentype = 'CAP')
+            BEGIN
+                -- Get current CAP BEFORE update
+                SELECT
+                    @currentCAP = remainingCap
+                FROM EmployeeMaster
+                WHERE id = @empId;
+
+                -- Update CAP
+                UPDATE EmployeeMaster
+                SET remainingCap = remainingCap + @refundAmnt
+                WHERE id = @empId;
+
+                -- Log CAP refund
+                INSERT INTO walletLogs
+                (walletId, actionType, prevAmnt, changeAmnt, newAmnt, description)
+                VALUES
+                (
+                    @walletId,
+                    'Refund-CAP',
+                    @currentCAP,
+                    @refundAmnt,
+                    @currentCAP + @refundAmnt,
+                    CONCAT('CAP Refund: ', @orderRefId)
+                );
+            END
+            /* ---------------- WALLET REFUND ---------------- */
+            ELSE
+            BEGIN
+                SET @newBalance = @currtbal + @refundAmnt;
+
+                INSERT INTO walletLogs
+                (walletId, actionType, prevAmnt, changeAmnt, newAmnt, description)
+                VALUES
+                (
+                    @walletId,
+                    'Credit',
+                    @currtbal,
+                    @refundAmnt,
+                    @newBalance,
+                    CONCAT('Refund: ', @orderRefId)
+                );
+
+                UPDATE walletMaster
+                SET balance = @newBalance
+                WHERE id = @walletId;
+            END
+
+            -- Update order status
+            UPDATE Orders
+            SET status = @statusId
+            WHERE id = @orderId;
+
+            COMMIT TRANSACTION;
+        END TRY
+        BEGIN CATCH
+            ROLLBACK TRANSACTION;
+            THROW;
+        END CATCH
+    END
+
+    ELSE IF (@statusId = 15)
+BEGIN
+    BEGIN TRANSACTION;
+
+        BEGIN TRY
+            -- Get order & employee
+            SELECT
+                @empId = EmployeeId,
+                @refundAmnt = amount,
+                @orderRefId = OrderId
+            FROM Orders
+            WHERE id = @orderId;
+
+
+            -- Get wallet
+            SELECT
+                @walletId = id,
+                @currtbal = balance
+            FROM walletMaster
+            WHERE employeeId = @empId;
+
+            -- Get last payment type
+            SELECT TOP 1
+                @paymentype = paymentMode
+            FROM walletLogs
+            WHERE description = @orderRefId
+            ORDER BY id DESC;
+
+            /* ---------------- CAP REFUND ---------------- */
+            IF (@paymentype = 'CAP')
+            BEGIN
+                -- Get current CAP BEFORE update
+                SELECT
+                    @currentCAP = remainingCap
+                FROM EmployeeMaster
+                WHERE id = @empId;
+
+                -- Update CAP
+                UPDATE EmployeeMaster
+                SET remainingCap = remainingCap + @refundAmnt
+                WHERE id = @empId;
+
+                -- Log CAP refund
+                INSERT INTO walletLogs
+                (walletId, actionType, prevAmnt, changeAmnt, newAmnt, description)
+                VALUES
+                (
+                    @walletId,
+                    'FOS-CAP',
+                    @currentCAP,
+                    @refundAmnt,
+                    @currentCAP + @refundAmnt,
+                    CONCAT('FOS Refund: ', @orderRefId)
+                );
+            END
+            /* ---------------- WALLET REFUND ---------------- */
+            ELSE
+            BEGIN
+                SET @newBalance = @currtbal + @refundAmnt;
+
+                INSERT INTO walletLogs
+                (walletId, actionType, prevAmnt, changeAmnt, newAmnt, description)
+                VALUES
+                (
+                    @walletId,
+                    'Credit',
+                    @currtbal,
+                    @refundAmnt,
+                    @newBalance,
+                    CONCAT('FOS: ', @orderRefId)
+                );
+
+                UPDATE walletMaster
+                SET balance = @newBalance
+                WHERE id = @walletId;
+            END
+
+            -- Update order status
+            UPDATE Orders
+            SET status = @statusId
+            WHERE id = @orderId;
+
+            COMMIT TRANSACTION;
+        END TRY
+        BEGIN CATCH
+            ROLLBACK TRANSACTION;
+            THROW;
+        END CATCH
+END
+    else
+    BEGIN
+        UPDATE Orders
+            SET status = @statusId
+            WHERE id = @orderId;
+    end
+END
+
+    IF(@flag = 'OrderStatus')
+    BEGIN
+        SELECT COUNT(*) AS TodaysSale
+        FROM Orders
+        WHERE createdAt >= CAST(GETDATE() AS DATE)
+        AND createdAt < DATEADD(DAY, 1, CAST(GETDATE() AS DATE));
+
+
+    end
+
+    IF (@flag = 'getOrder')
+    BEGIN
+       SELECT
+    o1.id,
+    o1.OrderId,
+    em.employee_name,
+    em.employee_code,
+    o1.amount,
+    gm.name AS status,
+
+    STRING_AGG(
+        mm.menuName + ' (' + CAST(ordi.Quantity AS VARCHAR) + ')',
+        ', '
+    ) AS OrderItems,
+
+    o1.createdAt,
+
+    (
+        SELECT SUM(oi.Quantity)
+        FROM OrderItems oi
+        WHERE oi.OrderId = o1.id
+    ) AS itemQuantity,
+
+    (
+        SELECT
+            mm2.menuName,
+            mm2.price,
+            oi2.Quantity
+        FROM OrderItems oi2
+        JOIN menuMaster mm2 ON mm2.id = oi2.MenuId
+        WHERE oi2.OrderId = o1.id
+        FOR JSON PATH
+    ) AS items
+
+FROM Orders o1
+
+LEFT JOIN EmployeeMaster em ON em.id = o1.EmployeeId
+LEFT JOIN genericMaster gm ON gm.id = o1.status
+
+-- ✅ ADD THESE JOINS
+LEFT JOIN OrderItems ordi ON ordi.OrderId = o1.id
+LEFT JOIN menuMaster mm ON mm.id = ordi.MenuId
+
+where o1.EmployeeId = @empId
+-- ✅ REQUIRED for STRING_AGG
+GROUP BY
+    o1.id,
+    o1.OrderId,
+    em.employee_name,
+    em.employee_code,
+    o1.amount,
+    gm.name,
+    o1.createdAt
+
+ORDER BY o1.id DESC;
+
+    END
+END;
+go
+

@@ -1,0 +1,26 @@
+@import "./fonts.css";
+@import "./tailwind.css";
+@import "./theme.css";
+
+/* Hide scrollbar but keep scroll */
+.no-scrollbar::-webkit-scrollbar {
+    display: none;
+}
+.no-scrollbar {
+    -ms-overflow-style: none; /* IE & Edge */
+    scrollbar-width: none; /* Firefox */
+}
+
+.thin-table .ant-table-thead > tr > th {
+    padding: 4px 8px !important;
+    font-size: 12px;
+}
+
+.thin-table .ant-table-tbody > tr > td {
+    padding: 3px 8px !important;
+    font-size: 12px;
+}
+
+.thin-table .ant-table-row {
+    height: 28px;
+}
